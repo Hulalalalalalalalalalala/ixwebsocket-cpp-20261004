@@ -187,6 +187,12 @@ namespace ix
         // Ditto for whether a message is compressed
         bool _receivedMessageCompressed;
 
+        // Set when a protocol error was detected while receiving frames.
+        // From then on incoming frames (except CLOSE ones, which are still
+        // processed to complete the closing handshake) are dropped while
+        // the connection is closing.
+        bool _protocolError;
+
         // Fragments are 32K long
         static constexpr size_t kChunkSize = 1 << 15;
 
@@ -291,6 +297,11 @@ namespace ix
         void unmaskReceiveBuffer(const wsheader_type& ws);
 
         std::string getMergedChunks() const;
+
+        // Reset all per-connection receive state (pending fragmented message,
+        // compression attribute of the message being received, unparsed frame
+        // bytes) so that a new connection starts with a clean slate.
+        void resetReceiveState();
 
         void setCloseReason(const std::string& reason);
         const std::string& getCloseReason() const;

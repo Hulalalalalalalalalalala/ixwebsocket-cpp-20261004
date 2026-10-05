@@ -62,7 +62,9 @@ namespace ix
         : _useMask(true)
         , _blockingSend(false)
         , _sendTimeoutSecs(-1)
+        , _fragmentedMessageKind(MessageKind::MSG_TEXT)
         , _receivedMessageCompressed(false)
+        , _protocolError(false)
         , _readyState(ReadyState::CLOSED)
         , _closeCode(WebSocketCloseConstants::kInternalErrorCode)
         , _closeWireSize(0)
@@ -101,6 +103,20 @@ namespace ix
         _pingIntervalSecs = pingIntervalSecs;
     }
 
+    void WebSocketTransport::resetReceiveState()
+    {
+        // A new connection must not inherit any receive state from a previous
+        // connection on this object: no pending fragmented message content or
+        // message kind, no stale compression attribute, no unparsed frame
+        // bytes and no latched protocol error.
+        _chunks.clear();
+        _fragmentedMessageKind = MessageKind::MSG_TEXT;
+        _receivedMessageCompressed = false;
+        _protocolError = false;
+        _rxbuf.clear();
+        _rxbufWanted = 0;
+    }
+
     // Client
     WebSocketInitResult WebSocketTransport::connectToUrl(const std::string& url,
                                                          const WebSocketHttpHeaders& headers,
@@ -111,6 +127,10 @@ namespace ix
         std::string protocol, host, path, query;
         int port;
         std::string remoteUrl(url);
+
+        // A previous connection on this object might have been interrupted in
+        // the middle of a fragmented message; start from a clean receive state.
+        resetReceiveState();
 
         WebSocketInitResult result;
         const int maxRedirections = 10;
@@ -182,6 +202,10 @@ namespace ix
         _useMask = false;
         _blockingSend = true;
         _sendTimeoutSecs = sendTimeoutSecs;
+
+        // A previous connection on this object might have been interrupted in
+        // the middle of a fragmented message; start from a clean receive state.
+        resetReceiveState();
 
         _socket = std::move(socket);
         _perMessageDeflate = ix::make_unique<WebSocketPerMessageDeflate>();
@@ -482,6 +506,7 @@ namespace ix
 
             if ((ws.rsv1 && !_enablePerMessageDeflate) || ws.rsv2 || ws.rsv3)
             {
+                _protocolError = true;
                 close(WebSocketCloseConstants::kProtocolErrorCode,
                       WebSocketCloseConstants::kProtocolErrorReservedBitUsed,
                       _rxbuf.size());
@@ -556,10 +581,22 @@ namespace ix
 
             _rxbufWanted = 0;
 
+            // Once a protocol error has been detected the connection is being
+            // closed. Drop every incoming frame from then on, except CLOSE
+            // frames which are still processed to complete the closing
+            // handshake. This holds whether the offending frame arrived alone
+            // or more frames were/are received along with it or afterwards.
+            if (_protocolError && ws.opcode != wsheader_type::CLOSE)
+            {
+                _rxbuf.erase(_rxbuf.begin(), _rxbuf.begin() + ws.header_size + (size_t) ws.N);
+                continue;
+            }
+
             if (!ws.fin && (ws.opcode == wsheader_type::PING || ws.opcode == wsheader_type::PONG ||
                             ws.opcode == wsheader_type::CLOSE))
             {
                 // Control messages should not be fragmented
+                _protocolError = true;
                 close(WebSocketCloseConstants::kProtocolErrorCode,
                       WebSocketCloseConstants::kProtocolErrorCodeControlMessageFragmented);
                 return;
@@ -576,25 +613,33 @@ namespace ix
             {
                 if (ws.opcode != wsheader_type::CONTINUATION)
                 {
+                    // A new text or binary message cannot start while a
+                    // fragmented message is still being received, whether or
+                    // not this frame has its fin bit set. The offending frame
+                    // and the interrupted message must not be delivered.
+                    if (!_chunks.empty())
+                    {
+                        _protocolError = true;
+                        close(WebSocketCloseConstants::kProtocolErrorCode,
+                              WebSocketCloseConstants::kProtocolErrorCodeDataOpcodeOutOfSequence);
+                        return;
+                    }
+
                     _fragmentedMessageKind = (ws.opcode == wsheader_type::TEXT_FRAME)
                                                  ? MessageKind::MSG_TEXT
                                                  : MessageKind::MSG_BINARY;
 
                     _receivedMessageCompressed = _enablePerMessageDeflate && ws.rsv1;
-
-                    // Continuation message needs to follow a non-fin TEXT or BINARY message
-                    if (!_chunks.empty())
-                    {
-                        close(WebSocketCloseConstants::kProtocolErrorCode,
-                              WebSocketCloseConstants::kProtocolErrorCodeDataOpcodeOutOfSequence);
-                    }
                 }
                 else if (_chunks.empty())
                 {
-                    // Continuation message need to follow a non-fin TEXT or BINARY message
+                    // A continuation frame must follow a non-final TEXT or
+                    // BINARY frame. The offending frame must not be delivered.
+                    _protocolError = true;
                     close(
                         WebSocketCloseConstants::kProtocolErrorCode,
                         WebSocketCloseConstants::kProtocolErrorCodeContinuationOpCodeOutOfSequence);
+                    return;
                 }
 
                 //
@@ -642,6 +687,7 @@ namespace ix
                 if (frameData.size() > 125)
                 {
                     // Unexpected frame type
+                    _protocolError = true;
                     close(WebSocketCloseConstants::kProtocolErrorCode,
                           WebSocketCloseConstants::kProtocolErrorPingPayloadOversized);
                     return;
@@ -736,6 +782,7 @@ namespace ix
             else
             {
                 // Unexpected frame type
+                _protocolError = true;
                 close(WebSocketCloseConstants::kProtocolErrorCode,
                       WebSocketCloseConstants::kProtocolErrorMessage,
                       _rxbuf.size());
