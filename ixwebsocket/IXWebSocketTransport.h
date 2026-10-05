@@ -68,7 +68,7 @@ namespace ix
         };
 
         using OnMessageCallback =
-            std::function<void(const std::string&, size_t, bool, MessageKind)>;
+            std::function<void(const std::string&, size_t, bool, MessageKind, const std::string&)>;
         using OnCloseCallback = std::function<void(uint16_t, const std::string&, size_t, bool)>;
 
         WebSocketTransport();
@@ -187,6 +187,10 @@ namespace ix
         // Ditto for whether a message is compressed
         bool _receivedMessageCompressed;
 
+        // Total compressed payload size (wire bytes, frame headers excluded) of
+        // the message currently being received, summed over all its fragments.
+        size_t _receivedMessageWireSize = 0;
+
         // Set when a protocol error was detected while receiving frames.
         // From then on incoming frames (except CLOSE ones, which are still
         // processed to complete the closing handshake) are dropped while
@@ -281,6 +285,7 @@ namespace ix
 
         void emitMessage(MessageKind messageKind,
                          const std::string& message,
+                         size_t wireSize,
                          bool compressedMessage,
                          const OnMessageCallback& onMessageCallback);
 

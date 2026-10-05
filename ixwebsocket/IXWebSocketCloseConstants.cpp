@@ -33,5 +33,7 @@ namespace ix
         "Fragmentation: continuation opcode out of sequence");
     const std::string WebSocketCloseConstants::kInvalidFramePayloadDataMessage(
         "Invalid frame payload data");
+    const std::string WebSocketCloseConstants::kInvalidCompressedPayloadMessage(
+        "Invalid compressed payload");
     const std::string WebSocketCloseConstants::kInvalidCloseCodeMessage("Invalid close code");
 } // namespace ix

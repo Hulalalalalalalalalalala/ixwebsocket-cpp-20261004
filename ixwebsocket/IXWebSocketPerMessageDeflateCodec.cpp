@@ -243,6 +243,11 @@ namespace ix
 
             if (ret == Z_NEED_DICT || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR)
             {
+                // A failed decompression fails the whole message: discard
+                // whatever was decoded before the error (this can be more
+                // than one buffer worth of data) so callers never observe a
+                // partial body.
+                out.clear();
                 return false; // zlib error
             }
 
