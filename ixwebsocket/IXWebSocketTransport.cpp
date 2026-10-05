@@ -232,6 +232,14 @@ namespace ix
         {
             initTimePointsAfterConnect();
             _pongReceived = false;
+
+            // A new connection must start with no pending fragmented message:
+            // drop any partially received message (and any unprocessed frame
+            // bytes) left over from a previous connection on this object.
+            _chunks.clear();
+            _receivedMessageCompressed = false;
+            _rxbuf.clear();
+            _rxbufWanted = 0;
         }
 
         _readyState = readyState;
@@ -576,25 +584,31 @@ namespace ix
             {
                 if (ws.opcode != wsheader_type::CONTINUATION)
                 {
+                    // A new message cannot start while a fragmented message
+                    // is still waiting for its final continuation frame.
+                    // The offending frame (and anything after it) must not be
+                    // delivered, so bail out right after initiating the close.
+                    if (!_chunks.empty())
+                    {
+                        close(
+                            WebSocketCloseConstants::kProtocolErrorCode,
+                            WebSocketCloseConstants::kProtocolErrorCodeDataOpcodeOutOfSequence);
+                        return;
+                    }
+
                     _fragmentedMessageKind = (ws.opcode == wsheader_type::TEXT_FRAME)
                                                  ? MessageKind::MSG_TEXT
                                                  : MessageKind::MSG_BINARY;
 
                     _receivedMessageCompressed = _enablePerMessageDeflate && ws.rsv1;
-
-                    // Continuation message needs to follow a non-fin TEXT or BINARY message
-                    if (!_chunks.empty())
-                    {
-                        close(WebSocketCloseConstants::kProtocolErrorCode,
-                              WebSocketCloseConstants::kProtocolErrorCodeDataOpcodeOutOfSequence);
-                    }
                 }
                 else if (_chunks.empty())
                 {
-                    // Continuation message need to follow a non-fin TEXT or BINARY message
+                    // Continuation message needs to follow a non-fin TEXT or BINARY message
                     close(
                         WebSocketCloseConstants::kProtocolErrorCode,
                         WebSocketCloseConstants::kProtocolErrorCodeContinuationOpCodeOutOfSequence);
+                    return;
                 }
 
                 //
