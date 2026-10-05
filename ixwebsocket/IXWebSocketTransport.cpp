@@ -847,6 +847,29 @@ namespace ix
         {
             bool success = _perMessageDeflate->decompress(message, _decompressedMessage);
 
+            if (!success)
+            {
+                // The compressed payload is invalid: the whole message
+                // fails. It must not be delivered, not even the partially
+                // decompressed content; the caller is notified with an
+                // error instead, and the connection is closed.
+                //
+                // Drop every incoming frame from then on, except CLOSE
+                // frames which are still processed to complete the closing
+                // handshake.
+                _protocolError = true;
+
+                // Close first, so that the connection is already closing
+                // when the error is emitted (sending from the error
+                // callback will fail).
+                close(WebSocketCloseConstants::kInvalidFramePayloadData,
+                      WebSocketCloseConstants::kDecompressionErrorMessage);
+
+                _decompressedMessage.clear();
+                onMessageCallback(_decompressedMessage, wireSize, true, messageKind);
+                return;
+            }
+
             if (messageKind == MessageKind::MSG_TEXT && !validateUtf8(_decompressedMessage))
             {
                 close(WebSocketCloseConstants::kInvalidFramePayloadData,
@@ -854,7 +877,7 @@ namespace ix
             }
             else
             {
-                onMessageCallback(_decompressedMessage, wireSize, !success, messageKind);
+                onMessageCallback(_decompressedMessage, wireSize, false, messageKind);
             }
         }
         else

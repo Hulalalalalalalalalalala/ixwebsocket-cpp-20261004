@@ -449,6 +449,28 @@ namespace ix
 
                     bool binary = messageKind == WebSocketTransport::MessageKind::MSG_BINARY;
 
+                    if (decompressionError)
+                    {
+                        // A message whose compressed payload could not be
+                        // decompressed is reported as an Error, never as a
+                        // Message, and without any (partial) body.
+                        webSocketMessageType = WebSocketMessageType::Error;
+                        webSocketErrorInfo.reason =
+                            WebSocketCloseConstants::kDecompressionErrorMessage;
+
+                        _onMessageCallback(ix::make_unique<WebSocketMessage>(
+                            webSocketMessageType,
+                            emptyMsg,
+                            wireSize,
+                            webSocketErrorInfo,
+                            WebSocketOpenInfo(),
+                            WebSocketCloseInfo(),
+                            binary));
+
+                        WebSocket::invokeTrafficTrackerCallback(wireSize, true);
+                        return;
+                    }
+
                     _onMessageCallback(ix::make_unique<WebSocketMessage>(webSocketMessageType,
                                                                          msg,
                                                                          wireSize,

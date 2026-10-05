@@ -243,6 +243,10 @@ namespace ix
 
             if (ret == Z_NEED_DICT || ret == Z_DATA_ERROR || ret == Z_MEM_ERROR)
             {
+                // On failure the output must be empty, even if some (possibly
+                // large, spanning multiple buffer fills) prefix was already
+                // decompressed before the error was detected.
+                out.clear();
                 return false; // zlib error
             }
 

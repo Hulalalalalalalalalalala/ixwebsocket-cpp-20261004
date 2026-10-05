@@ -34,4 +34,6 @@ namespace ix
     const std::string WebSocketCloseConstants::kInvalidFramePayloadDataMessage(
         "Invalid frame payload data");
     const std::string WebSocketCloseConstants::kInvalidCloseCodeMessage("Invalid close code");
+    const std::string WebSocketCloseConstants::kDecompressionErrorMessage(
+        "Decompression failed: invalid compressed payload");
 } // namespace ix
