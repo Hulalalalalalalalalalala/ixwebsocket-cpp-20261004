@@ -47,6 +47,13 @@ if (USE_ZLIB)
   )
 endif()
 
+# Raw-socket permessage-deflate failure cases rely on POSIX sockets and zlib.
+if (UNIX AND USE_ZLIB)
+  list(APPEND TEST_TARGET_NAMES
+    IXWebSocketDecompressionFailureTest
+  )
+endif()
+
 # Ping test fails intermittently, disabling them for now
 # IXWebSocketPingTest.cpp
 # IXWebSocketPingTimeoutTest.cpp

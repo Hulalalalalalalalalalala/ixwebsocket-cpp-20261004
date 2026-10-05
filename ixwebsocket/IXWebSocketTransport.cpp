@@ -112,9 +112,12 @@ namespace ix
         _chunks.clear();
         _fragmentedMessageKind = MessageKind::MSG_TEXT;
         _receivedMessageCompressed = false;
+        _receivedMessageWireSize = 0;
         _protocolError = false;
         _rxbuf.clear();
         _rxbufWanted = 0;
+        _decompressedMessage.clear();
+        _compressedMessage.clear();
     }
 
     // Client
@@ -630,6 +633,7 @@ namespace ix
                                                  : MessageKind::MSG_BINARY;
 
                     _receivedMessageCompressed = _enablePerMessageDeflate && ws.rsv1;
+                    _receivedMessageWireSize = 0;
                 }
                 else if (_chunks.empty())
                 {
@@ -642,6 +646,10 @@ namespace ix
                     return;
                 }
 
+                // Accumulate the on-the-wire payload size of this possibly
+                // fragmented message. Frame headers are not counted.
+                _receivedMessageWireSize += frameData.size();
+
                 //
                 // Usual case. Small unfragmented messages
                 //
@@ -649,10 +657,18 @@ namespace ix
                 {
                     emitMessage(_fragmentedMessageKind,
                                 frameData,
+                                _receivedMessageWireSize,
                                 _receivedMessageCompressed,
                                 onMessageCallback);
 
                     _receivedMessageCompressed = false;
+                    _receivedMessageWireSize = 0;
+
+                    // A failed decompression fails the whole message and is
+                    // closing the connection. Stop processing the receive
+                    // buffer at once, so no frame following the bad message in
+                    // the same bytes is ever delivered or answered.
+                    if (_protocolError) return;
                 }
                 else
                 {
@@ -669,15 +685,23 @@ namespace ix
                     {
                         emitMessage(_fragmentedMessageKind,
                                     getMergedChunks(),
+                                    _receivedMessageWireSize,
                                     _receivedMessageCompressed,
                                     onMessageCallback);
 
                         _chunks.clear();
                         _receivedMessageCompressed = false;
+                        _receivedMessageWireSize = 0;
+
+                        if (_protocolError) return;
                     }
                     else
                     {
-                        emitMessage(MessageKind::FRAGMENT, std::string(), false, onMessageCallback);
+                        emitMessage(MessageKind::FRAGMENT,
+                                    std::string(),
+                                    0,
+                                    false,
+                                    onMessageCallback);
                     }
                 }
             }
@@ -700,12 +724,14 @@ namespace ix
                     sendData(wsheader_type::PONG, frameData, compress);
                 }
 
-                emitMessage(MessageKind::PING, frameData, false, onMessageCallback);
+                emitMessage(MessageKind::PING, frameData, frameData.size(), false,
+                            onMessageCallback);
             }
             else if (ws.opcode == wsheader_type::PONG)
             {
                 _pongReceived = true;
-                emitMessage(MessageKind::PONG, frameData, false, onMessageCallback);
+                emitMessage(MessageKind::PONG, frameData, frameData.size(), false,
+                            onMessageCallback);
             }
             else if (ws.opcode == wsheader_type::CLOSE)
             {
@@ -837,15 +863,45 @@ namespace ix
 
     void WebSocketTransport::emitMessage(MessageKind messageKind,
                                          const std::string& message,
+                                         size_t wireSize,
                                          bool compressedMessage,
                                          const OnMessageCallback& onMessageCallback)
     {
-        size_t wireSize = message.size();
-
         // When the RSV1 bit is 1 it means the message is compressed
         if (compressedMessage && messageKind != MessageKind::FRAGMENT)
         {
             bool success = _perMessageDeflate->decompress(message, _decompressedMessage);
+
+            // zlib rejected the compressed payload. The whole message fails:
+            // no part of the (possibly partially) decompressed body is
+            // delivered, a single decompression error is reported with an
+            // empty body, and the connection is closed with code 1007.
+            if (!success)
+            {
+                _protocolError = true;
+                _chunks.clear();
+                _receivedMessageCompressed = false;
+                _receivedMessageWireSize = 0;
+
+                // Discard any body zlib managed to produce before rejecting
+                // the stream, so the partially decoded content can never be
+                // delivered or carried over to a later connection.
+                _decompressedMessage.clear();
+
+                // Close first (sends the 1007 frame and switches the
+                // connection to CLOSING) so that the error callback already
+                // observes a closing connection and any attempt to send from
+                // within it fails.
+                close(WebSocketCloseConstants::kInvalidFramePayloadData,
+                      WebSocketCloseConstants::kInvalidCompressedPayloadMessage);
+
+                onMessageCallback(std::string(),
+                                  wireSize,
+                                  true,
+                                  messageKind,
+                                  WebSocketCloseConstants::kInvalidCompressedPayloadMessage);
+                return;
+            }
 
             if (messageKind == MessageKind::MSG_TEXT && !validateUtf8(_decompressedMessage))
             {
@@ -854,7 +910,8 @@ namespace ix
             }
             else
             {
-                onMessageCallback(_decompressedMessage, wireSize, !success, messageKind);
+                onMessageCallback(
+                    _decompressedMessage, wireSize, false, messageKind, std::string());
             }
         }
         else
@@ -866,7 +923,7 @@ namespace ix
             }
             else
             {
-                onMessageCallback(message, wireSize, false, messageKind);
+                onMessageCallback(message, wireSize, false, messageKind, std::string());
             }
         }
     }

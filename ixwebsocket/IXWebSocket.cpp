@@ -413,8 +413,31 @@ namespace ix
                 [this](const std::string& msg,
                        size_t wireSize,
                        bool decompressionError,
-                       WebSocketTransport::MessageKind messageKind)
+                       WebSocketTransport::MessageKind messageKind,
+                       const std::string& decompressionReason)
                 {
+                    // A message whose compressed payload was rejected by zlib
+                    // is reported once as an Error rather than as a Message:
+                    // the body is empty and the reason describes the failed
+                    // decompression.
+                    if (decompressionError)
+                    {
+                        WebSocketErrorInfo webSocketErrorInfo;
+                        webSocketErrorInfo.decompressionError = true;
+                        webSocketErrorInfo.reason = decompressionReason;
+
+                        _onMessageCallback(ix::make_unique<WebSocketMessage>(
+                            WebSocketMessageType::Error,
+                            emptyMsg,
+                            wireSize,
+                            webSocketErrorInfo,
+                            WebSocketOpenInfo(),
+                            WebSocketCloseInfo()));
+
+                        WebSocket::invokeTrafficTrackerCallback(wireSize, true);
+                        return;
+                    }
+
                     WebSocketMessageType webSocketMessageType {WebSocketMessageType::Error};
                     switch (messageKind)
                     {
