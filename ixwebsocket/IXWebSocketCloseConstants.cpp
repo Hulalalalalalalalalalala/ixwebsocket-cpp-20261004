@@ -36,4 +36,5 @@ namespace ix
     const std::string WebSocketCloseConstants::kInvalidCloseCodeMessage("Invalid close code");
     const std::string WebSocketCloseConstants::kDecompressionErrorMessage(
         "Decompression failed: invalid compressed payload");
+    const std::string WebSocketCloseConstants::kSendCancelledMessage("Send cancelled");
 } // namespace ix

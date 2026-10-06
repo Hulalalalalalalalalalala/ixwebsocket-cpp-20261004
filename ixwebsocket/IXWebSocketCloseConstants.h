@@ -35,5 +35,6 @@ namespace ix
         static const std::string kInvalidFramePayloadDataMessage;
         static const std::string kInvalidCloseCodeMessage;
         static const std::string kDecompressionErrorMessage;
+        static const std::string kSendCancelledMessage;
     };
 } // namespace ix

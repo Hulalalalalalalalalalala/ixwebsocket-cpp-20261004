@@ -65,6 +65,7 @@ namespace ix
         , _fragmentedMessageKind(MessageKind::MSG_TEXT)
         , _receivedMessageCompressed(false)
         , _protocolError(false)
+        , _sendCancelled(false)
         , _readyState(ReadyState::CLOSED)
         , _closeCode(WebSocketCloseConstants::kInternalErrorCode)
         , _closeWireSize(0)
@@ -131,6 +132,10 @@ namespace ix
         // A previous connection on this object might have been interrupted in
         // the middle of a fragmented message; start from a clean receive state.
         resetReceiveState();
+
+        // A send cancelled on a previous connection must not prevent sending
+        // on the new one.
+        _sendCancelled = false;
 
         WebSocketInitResult result;
         const int maxRedirections = 10;
@@ -206,6 +211,10 @@ namespace ix
         // A previous connection on this object might have been interrupted in
         // the middle of a fragmented message; start from a clean receive state.
         resetReceiveState();
+
+        // A send cancelled on a previous connection must not prevent sending
+        // on the new one.
+        _sendCancelled = false;
 
         _socket = std::move(socket);
         _perMessageDeflate = ix::make_unique<WebSocketPerMessageDeflate>();
@@ -419,6 +428,7 @@ namespace ix
             _rxbuf.clear();
             // close code and reason were set when calling close()
             closeSocket();
+            clearSendBuffer();
             setReadyState(ReadyState::CLOSED);
         }
 
@@ -429,6 +439,12 @@ namespace ix
     {
         std::lock_guard<std::mutex> lock(_txbufMutex);
         return _txbuf.empty();
+    }
+
+    void WebSocketTransport::clearSendBuffer()
+    {
+        std::lock_guard<std::mutex> lock(_txbufMutex);
+        _txbuf.clear();
     }
 
     template<class Iterator>
@@ -803,6 +819,7 @@ namespace ix
             if (_readyState == ReadyState::CLOSING)
             {
                 closeSocket();
+                clearSendBuffer();
                 setReadyState(ReadyState::CLOSED);
             }
             // if we weren't closing, then close using abnormal close code and message
@@ -912,6 +929,14 @@ namespace ix
             return WebSocketSendInfo(false);
         }
 
+        // Once a send has been cancelled the connection is being closed and
+        // no further data frames may be written to it; only close frames are
+        // still allowed so that the closing handshake can complete.
+        if (_sendCancelled && type != wsheader_type::CLOSE)
+        {
+            return WebSocketSendInfo(false);
+        }
+
         size_t payloadSize = message.size();
         size_t wireSize = message.size();
         bool compressionError = false;
@@ -943,12 +968,15 @@ namespace ix
         }
 
         bool success = true;
+        bool sendCancelled = false;
 
         // Common case for most message. No fragmentation required.
         if (wireSize < kChunkSize)
         {
             success = sendFragment(type, true, message_begin, message_end, compress);
 
+            // The message was committed as a single frame, so the send is
+            // complete no matter what the progress callback returns.
             if (onProgressCallback)
             {
                 onProgressCallback(0, 1);
@@ -995,11 +1023,29 @@ namespace ix
 
                 if (onProgressCallback && !onProgressCallback((int) i, (int) steps))
                 {
+                    // The send is only cancelled if the final fragment is
+                    // still missing. If the callback of the last fragment
+                    // returns false the message was fully committed and the
+                    // send is a success.
+                    sendCancelled = !lastStep;
                     break;
                 }
 
                 begin += kChunkSize;
             }
+        }
+
+        if (sendCancelled)
+        {
+            // The message was not fully sent: fail the send, do not send the
+            // remaining fragments, and do not "complete" the message with a
+            // truncated final fragment either. The already committed prefix
+            // is a partial message that the peer can never reassemble, so
+            // the connection cannot be used anymore: close it.
+            _sendCancelled = true;
+            success = false;
+            close(WebSocketCloseConstants::kNormalClosureCode,
+                  WebSocketCloseConstants::kSendCancelledMessage);
         }
 
         // Request to flush the send buffer on the background thread if it isn't empty
@@ -1155,6 +1201,9 @@ namespace ix
             else if (ret <= 0)
             {
                 closeSocket();
+                // The socket is closed: pending outgoing bytes can never be
+                // sent. (_txbufMutex is held by this method.)
+                _txbuf.clear();
                 if (_readyState != ReadyState::CLOSING)
                 {
                     setReadyState(ReadyState::CLOSED);
@@ -1252,6 +1301,9 @@ namespace ix
     {
         closeSocket();
 
+        // The socket is closed: pending outgoing bytes can never be sent.
+        clearSendBuffer();
+
         setCloseReason(reason);
         _closeCode = code;
         _closeWireSize = closeWireSize;
@@ -1332,8 +1384,19 @@ namespace ix
             timeoutSecs = std::chrono::seconds(_pingIntervalSecs);
         }
 
-        while (!isSendBufferEmpty() && !_requestInitCancellation)
+        while (!isSendBufferEmpty())
         {
+            // A cancellation was requested (close() was called). While the
+            // connection is closing, keep flushing the already committed
+            // bytes (the rest of the fragment being written, then the close
+            // frame) so that a peer which resumes reading receives them in
+            // order, but give up once the closing delay has expired.
+            if (_requestInitCancellation &&
+                (_readyState != ReadyState::CLOSING || closingDelayExceeded()))
+            {
+                break;
+            }
+
             // Wait with a 10ms timeout until the socket is ready to write.
             // This way we are not busy looping
             PollResultType result = _socket->isReadyToWrite(10);
@@ -1341,6 +1404,7 @@ namespace ix
             if (result == PollResultType::Error)
             {
                 closeSocket();
+                clearSendBuffer();
                 setReadyState(ReadyState::CLOSED);
                 return false;
             }

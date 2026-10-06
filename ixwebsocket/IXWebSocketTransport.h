@@ -173,6 +173,11 @@ namespace ix
         std::vector<uint8_t> _txbuf;
         mutable std::mutex _txbufMutex;
 
+        // Set when a send was cancelled through its progress callback before
+        // the final fragment was committed. The connection is closing from
+        // then on and no further data frames may be written to it.
+        std::atomic<bool> _sendCancelled;
+
         // Hold fragments for multi-fragments messages in a list. We support receiving very large
         // messages (tested messages up to 700M) and we cannot put them in a single
         // buffer that is resized, as this operation can be slow when a buffer has its
@@ -285,6 +290,7 @@ namespace ix
                          const OnMessageCallback& onMessageCallback);
 
         bool isSendBufferEmpty() const;
+        void clearSendBuffer();
 
         template<class Iterator>
         void appendToSendBuffer(const std::vector<uint8_t>& header,
