@@ -122,6 +122,16 @@ namespace ix
                                                          const WebSocketHttpHeaders& headers,
                                                          int timeoutSecs)
     {
+        // A previous connection on this object might have been torn down
+        // with unsent bytes still buffered (message fragments, close
+        // frame); they must not be sent on the new connection. Taken before
+        // (and never while holding) the _socketMutex to avoid a lock
+        // ordering inversion with sendOnSocket().
+        {
+            std::lock_guard<std::mutex> lock(_txbufMutex);
+            _txbuf.clear();
+        }
+
         std::lock_guard<std::mutex> lock(_socketMutex);
 
         std::string protocol, host, path, query;
@@ -196,6 +206,13 @@ namespace ix
                                                             HttpRequestPtr request,
                                                             int sendTimeoutSecs)
     {
+        // See connectToUrl: no stale unsent byte from a previous connection
+        // may leak into this one.
+        {
+            std::lock_guard<std::mutex> lock(_txbufMutex);
+            _txbuf.clear();
+        }
+
         std::lock_guard<std::mutex> lock(_socketMutex);
 
         // Server should not mask the data it sends to the client
@@ -907,7 +924,14 @@ namespace ix
                                                    bool compress,
                                                    const OnProgressCallback& onProgressCallback)
     {
-        if (_readyState != ReadyState::OPEN && _readyState != ReadyState::CLOSING)
+        // Data frames can only be sent on an open connection. Control frames
+        // (close, ping, pong) can still be emitted while the connection is
+        // closing, to complete the closing handshake.
+        bool isDataFrame = type == wsheader_type::TEXT_FRAME ||
+                           type == wsheader_type::BINARY_FRAME ||
+                           type == wsheader_type::CONTINUATION;
+        if (_readyState != ReadyState::OPEN &&
+            (_readyState != ReadyState::CLOSING || isDataFrame))
         {
             return WebSocketSendInfo(false);
         }
@@ -943,6 +967,7 @@ namespace ix
         }
 
         bool success = true;
+        bool cancelled = false;
 
         // Common case for most message. No fragmentation required.
         if (wireSize < kChunkSize)
@@ -951,6 +976,9 @@ namespace ix
 
             if (onProgressCallback)
             {
+                // The message was fully committed to the send buffer (this
+                // is the only fragment), so the return value of the
+                // progress callback cannot cancel anything here.
                 onProgressCallback(0, 1);
             }
         }
@@ -995,11 +1023,34 @@ namespace ix
 
                 if (onProgressCallback && !onProgressCallback((int) i, (int) steps))
                 {
+                    // The caller asked to cancel the send. If the final
+                    // fragment was already committed (last step) the message
+                    // is complete and this is not a cancellation: the send
+                    // is still a success. Otherwise the message is missing
+                    // its final fragment and can never be completed.
+                    cancelled = !lastStep;
                     break;
                 }
 
                 begin += kChunkSize;
             }
+        }
+
+        if (cancelled)
+        {
+            //
+            // The message prefix that was already sent must not be completed
+            // into a truncated message, and no further fragment of this
+            // message can be sent. The connection is unusable from now on
+            // (the peer would wait forever for the missing final fragment),
+            // so it is closed with a normal closure code; the close frame is
+            // appended after the pending bytes so that the peer first
+            // receives the remaining bytes of the fragment being written.
+            //
+            close(WebSocketCloseConstants::kNormalClosureCode,
+                  WebSocketCloseConstants::kSendCancelledMessage);
+
+            return WebSocketSendInfo(false);
         }
 
         // Request to flush the send buffer on the background thread if it isn't empty
@@ -1138,7 +1189,7 @@ namespace ix
 
     bool WebSocketTransport::sendOnSocket()
     {
-        std::lock_guard<std::mutex> lock(_txbufMutex);
+        std::unique_lock<std::mutex> lock(_txbufMutex);
 
         while (_txbuf.size())
         {
@@ -1154,6 +1205,9 @@ namespace ix
             }
             else if (ret <= 0)
             {
+                // closeSocket() also needs the _txbufMutex (to drop the
+                // pending bytes), so it must be released first.
+                lock.unlock();
                 closeSocket();
                 if (_readyState != ReadyState::CLOSING)
                 {
@@ -1235,8 +1289,19 @@ namespace ix
 
     void WebSocketTransport::closeSocket()
     {
-        std::lock_guard<std::mutex> lock(_socketMutex);
-        _socket->close();
+        {
+            std::lock_guard<std::mutex> lock(_socketMutex);
+            _socket->close();
+        }
+
+        // The socket is closed: pending outgoing bytes can never be sent,
+        // so drop them. bufferedAmount() goes down to 0 once the connection
+        // is closed, and a later reconnection on this object cannot leak
+        // stale bytes (message fragments, close frames) into the new
+        // connection. The locks are taken sequentially, never nested, to
+        // avoid a lock ordering inversion with sendOnSocket().
+        std::lock_guard<std::mutex> lock(_txbufMutex);
+        _txbuf.clear();
     }
 
     bool WebSocketTransport::wakeUpFromPoll(uint64_t wakeUpCode)
@@ -1332,8 +1397,22 @@ namespace ix
             timeoutSecs = std::chrono::seconds(_pingIntervalSecs);
         }
 
-        while (!isSendBufferEmpty() && !_requestInitCancellation)
+        while (!isSendBufferEmpty())
         {
+            if (_requestInitCancellation)
+            {
+                // A close was requested. While the closing handshake is in
+                // progress, keep flushing the pending bytes (the remaining
+                // bytes of the fragment being written first, then the close
+                // frame) so that the peer receives well-formed frames, but
+                // only until the closing delay expires: a peer that stopped
+                // reading must not keep us stuck here forever.
+                if (_readyState != ReadyState::CLOSING || closingDelayExceeded())
+                {
+                    break;
+                }
+            }
+
             // Wait with a 10ms timeout until the socket is ready to write.
             // This way we are not busy looping
             PollResultType result = _socket->isReadyToWrite(10);
